@@ -1,0 +1,629 @@
+\documentclass{tietreport}
+
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{longtable}
+
+\usepackage[
+  date=year,
+  style=alphabetic,
+  backend=biber,
+  sorting=nty,
+  maxnames=5,
+  minnames=3,
+  maxalphanames=4,
+  minalphanames=3,
+  backref=true,
+  doi=false,
+  isbn=false,
+  url=false,
+  eprint=false
+]{biblatex}
+\addbibresource{references.bib}
+
+%% ==================================================
+%% TITLE PAGE FIELDS
+%% ==================================================
+
+\TitlePageHeader{%
+  UCS503 -- Software Engineering%
+}
+
+\ProjectTitle{%
+  MeshChat%
+}
+
+\ProjectSubTitle{%
+  Radio Hardware, Integration and Deployment --- Project Journal%
+}
+
+\author{%
+  \texttt{1024031043} Sanket Kamboj%
+}
+
+\TitlePageSubText{%
+  Computer Engineering (COE), BE Third Year -- 5th Semester%
+}
+
+\AdvisorName{%
+  Ms. Jhony Bansal%
+}
+
+\TitlePageFooterText{{%
+    \large End-Semester Evaluation \\[0.2cm]
+    \bfseries Computer Science and Engineering
+    Department%
+  } \\[0.15cm]
+  Thapar Institute of Engineering and Technology,
+  Patiala%
+}
+
+%% ==================================================
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+% ===================================================================
+\chapter{Scope of This Journal}
+% ===================================================================
+
+MeshChat is an infrastructure-free messaging system: phones join the
+WiFi network of a nearby ESP32-C3 node, nodes relay messages over a
+LoRa radio link to a Raspberry Pi master, and the master routes them
+to the node where the recipient is attached. The system is a
+single-hop star, not a multi-hop mesh.
+
+This journal is the second of two project journals. My teammate
+Parth Deshmukh's journal (folder \texttt{parth\_journal}) follows the
+software layers: architecture, the packet protocol, the master's
+routing, polling and queue code, the node firmware structure, the
+host-side test suites and the integration review. To avoid
+repeating it, mine covers what that journal leaves out: the
+\textbf{physical hardware}, the \textbf{radio interface on both
+platforms}, the \textbf{over-the-air integration} of node and master,
+the \textbf{phone interface and its build pipeline}, and
+\textbf{deployment and field validation}. Table~\ref{tab:split} shows
+the split; the few overlaps are deliberate and are treated from a
+different angle.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|p{1.7in}|p{1.9in}|p{1.9in}|}
+  \hline
+  \textbf{Topic} & \textbf{Parth's journal} & \textbf{This journal} \\
+  \hline
+  Architecture and scope & Star topology, state model &
+  Hardware selection, power, RF numbers \\
+  \hline
+  Radio band mismatch & Noted as a problem &
+  Chip limits, frequency words, migration path \\
+  \hline
+  Packet protocol & Types, fields, validation &
+  Byte parity with node and timing over the air \\
+  \hline
+  Master software & Routing, poller, SQLite queue &
+  Linux radio interface (spidev, libgpiod), wiring \\
+  \hline
+  Node firmware & Tasks, queues, session table &
+  SPI bring-up, DIO0 interrupt, WiFi and portal tuning \\
+  \hline
+  Phone interface & One line (embedded client) &
+  Full web client, protocol and build pipeline \\
+  \hline
+  Testing & Host suites, 43 and 149 results &
+  Field-validation plan, what tests cannot show \\
+  \hline
+  Review & Remaining engineering work &
+  Deployment gaps, security findings, fix list \\
+  \hline
+\end{tabular}
+\caption{Division of coverage between the two journals}
+\label{tab:split}
+\end{table}
+
+All facts here come from the repository: the source code, its
+comments, the design document and the database sketch
+(\texttt{db.txt}, committed 3 September). Figures marked
+\emph{computed} are calculations; the repository holds no field
+measurements yet, and this journal says so wherever it matters.
+
+% ===================================================================
+\chapter{Hardware and RF Reference}
+% ===================================================================
+
+\section{Components}
+
+\begin{itemize}
+  \item \textbf{Node:} ESP32-C3 mini board and an SX1278 (Ra-02,
+    AI-Thinker) LoRa module, 433~MHz antenna.
+  \item \textbf{Master:} Raspberry Pi with a second Ra-02 module on
+    SPI0, 433~MHz antenna. The design document recommends a
+    separate 3.3~V regulator for the radio, because transmit current
+    spikes of about 120~mA exceed what the Pi's 3.3~V header pin is
+    sized for.
+\end{itemize}
+
+\section{Wiring}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|l|l|}
+  \hline
+  \textbf{ESP32-C3} & \textbf{Ra-02} & \textbf{Signal} \\
+  \hline
+  GPIO 6 & SCK & SPI clock \\
+  \hline
+  GPIO 7 & MOSI & Data to radio \\
+  \hline
+  GPIO 2 & MISO & Data from radio \\
+  \hline
+  GPIO 10 & NSS & Chip select \\
+  \hline
+  GPIO 3 & RESET & Radio reset \\
+  \hline
+  GPIO 1 & DIO0 & RxDone / TxDone interrupt \\
+  \hline
+  3.3 V, GND & 3.3 V, GND & Power (never 5 V) \\
+  \hline
+\end{tabular}
+\caption{Node wiring (all pin numbers live in \texttt{hardware\_config.h})}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|l|l|l|}
+  \hline
+  \textbf{Ra-02} & \textbf{BCM GPIO} & \textbf{Pin} & \textbf{Note} \\
+  \hline
+  SCK & GPIO 11 & 23 & SPI0 clock \\
+  \hline
+  MOSI & GPIO 10 & 19 & SPI0 \\
+  \hline
+  MISO & GPIO 9 & 21 & SPI0 \\
+  \hline
+  NSS & GPIO 22 & 15 & Driven manually \\
+  \hline
+  RESET & GPIO 25 & 22 & Low 10 ms at start \\
+  \hline
+  DIO0 & GPIO 23 & 16 & Interrupt line \\
+  \hline
+  3.3 V, GND & -- & 1 or 17, 6 & Separate regulator advised \\
+  \hline
+\end{tabular}
+\caption{Master wiring; the working pin for DIO0 is GPIO~23 although
+\texttt{radio.h} says 24}
+\end{table}
+
+\section{Radio Configuration}
+
+Both radios use the same settings, written directly to SX1278
+registers \cite{sx1278datasheet}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|l|}
+  \hline
+  \textbf{Setting} & \textbf{Value} \\
+  \hline
+  Frequency word & \texttt{0x6C4000} (433 MHz) \\
+  \hline
+  Modem config 1, 2, 3 & \texttt{0x72}, \texttt{0x74}, \texttt{0x04} \\
+  & 125 kHz, CR 4/5, SF7, CRC on, AGC auto \\
+  \hline
+  Preamble, sync word & 8 symbols, \texttt{0x12} (private) \\
+  \hline
+  FIFO base TX, RX & \texttt{0x80}, \texttt{0x00} \\
+  \hline
+  PA configuration & Node \texttt{0x8C} (+14 dBm); master \texttt{0x80} (+2 dBm) \\
+  \hline
+\end{tabular}
+\caption{Radio register settings}
+\end{table}
+
+The frequency word is $f(\mathrm{MHz}) \times 16384$. This gives
+\texttt{0x6C4000} for 433~MHz and \texttt{0xD84400} for 865.0625~MHz,
+the first channel of the design document's band.
+
+\section{Airtime and Link Budget (computed)}
+
+Using the time-on-air formula at SF7, 125~kHz, CR 4/5 (symbol time
+1.024~ms, preamble 12.5~ms):
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|r|r|r|}
+  \hline
+  \textbf{Frame} & \textbf{Bytes} & \textbf{Symbols} &
+  \textbf{Airtime (ms)} \\
+  \hline
+  ACK or empty POLL & 4 & 18 & 31.0 \\
+  \hline
+  PRESENCE & 23 & 48 & 61.7 \\
+  \hline
+  DATA, 20 characters & 58 & 98 & 112.9 \\
+  \hline
+  DATA, maximum & 138 & 208 & 225.5 \\
+  \hline
+\end{tabular}
+\caption{Time on air}
+\end{table}
+
+A polling slot therefore costs about 62~ms idle, 175~ms for an uplink
+message and 144~ms for a downlink delivery; an idle cycle over $N$
+nodes takes about $62N$~ms.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|r|r|r|r|r|}
+  \hline
+  \textbf{Case} & \textbf{TX} & \textbf{Loss} & \textbf{RX} &
+  \textbf{Sens.} & \textbf{Margin} \\
+  \hline
+  Planned & 20 & 103 & $-83$ & $-123$ & 40 dB \\
+  \hline
+  Uplink (node) & 14 & 103 & $-89$ & $-123$ & 34 dB \\
+  \hline
+  Downlink (master) & 2 & 103 & $-101$ & $-123$ & 22 dB \\
+  \hline
+\end{tabular}
+\caption{Link budget at 1~km (dBm, dB; antenna gains ignored)}
+\end{table}
+
+\section{The Band Mismatch}
+
+The design document specifies an SX1276 at 865--867~MHz and says the
+SX1278 cannot reach that band. The modules in use are SX1278
+(about 420--525~MHz), so the prototype runs at 433~MHz. All four chips
+of the SX1276--79 family report version \texttt{0x12}, so the
+firmware's version check cannot reveal which variant is fitted. The
+design document also says 433~MHz belongs to a different regulatory
+exemption class, while the hardware configuration comments call it
+permitted; this is unresolved and needs a definite answer before
+deployment. Migrating to an SX1276 means a new frequency word and
+clearing the low-frequency-mode bit.
+
+% ===================================================================
+\chapter{Weekly Journal}
+% ===================================================================
+
+The weeks follow the same six-week structure as the companion
+journal; the full text of each week is in the \texttt{sanket-journal}
+folder as \texttt{week\_1.md} to \texttt{week\_6.md}. Here each week is
+summarised.
+
+\section{Week 1 -- Hardware Selection, Power Budget and RF Planning}
+
+\paragraph{Done.} Chose the hardware, fixed the RF parameter set,
+computed airtime and the link budget, and wrote the first version of
+the SQLite queue table (\texttt{db.txt}: destination and source user
+ID, message ID, TTL, payload and length, expiry and creation time;
+the final \texttt{queue.c} adds a destination index and WAL
+journaling).
+
+\paragraph{Problems.} The designed radio band is out of reach for the
+modules in hand; the regulatory status of 433~MHz is unresolved;
+transmit power on the two sides differs, leaving the downlink 18~dB
+weaker than planned.
+
+\paragraph{Outcome.} The deviation is documented with a migration
+path, and design claims became numbers (airtime, margin, current)
+that later separated software problems from physics.
+
+\section{Week 2 -- Node Radio Wiring and SX1278 Bring-Up}
+
+\paragraph{Done.} Wired the radio to the ESP32-C3; configured SPI2
+at 8~MHz, mode 0; implemented the reset pulse, version check
+(\texttt{0x12}), register setup and the DIO0 interrupt, which only
+notifies the radio task. The radio task alone owns the chip and feeds
+the watchdog in two-second slices while waiting for a POLL.
+
+\paragraph{Problems.} The LoRa bit is writable only in sleep mode; a
+floating DIO0 caused edge storms; TxDone and RxDone share one pin, so
+the mapping must follow the current mode. The logged RSSI uses an
+offset of $-157$, which belongs to the high-frequency port; at 433~MHz
+the offset is $-164$, so logged RSSI is about 7~dB optimistic.
+
+\paragraph{Outcome.} A fixed sleep--LoRa--standby sequence, a
+pull-down and a yield on empty interrupts. Lesson: bring-up is about
+ownership and ordering.
+
+\section{Week 3 -- Raspberry Pi Radio Interface}
+
+\paragraph{Done.} Ported the same register behaviour to Linux:
+\texttt{/dev/spidev0.0} at 1~MHz, chip select, reset and DIO0 through
+libgpiod \cite{libgpiod,spidevdocs}, DIO0 as a non-blocking event file
+descriptor waited on with \texttt{poll()}, stale events drained before
+transmit, a three-second transmit-complete wait with diagnostics,
+retry on initialisation, and recovery when the chip leaves LoRa mode.
+
+\paragraph{Problems.} The header gives DIO0 as GPIO~24 but the code
+uses GPIO~23, and chip select (GPIO~22) is not in the header; the
+kernel also toggles the unused CE0 pin; the Pi's rail browns out
+under transmit current; \texttt{install.sh} installs neither libgpiod
+nor SPI support.
+
+\paragraph{Outcome.} Wiring follows the code; transmit power is at
+the minimum and the radio is re-initialised when needed; a regulator
+is the real fix. Lesson: a driver does not simply port to Linux.
+
+\section{Week 4 -- Over-the-Air Integration}
+
+\paragraph{Done.} Confirmed that the packet module is byte-identical
+on both sides and that the register setups match apart from transmit
+power; checked timing (500~ms slot timeout against a 225.5~ms longest
+frame; six-second absence timeout against a 1.2~s idle cycle of 20
+nodes); traced the acknowledgement flow.
+
+\paragraph{Problems fixed.} The master stamped its own ID in POLL
+packets, which nodes ignore; a 64-bit queue row ID cannot ride in an
+8-bit field; a stale route echoed messages back to the sender.
+
+\paragraph{Problems open (found by code review).} A node that sends
+its own DATA or PRESENCE while a delivery rides on the POLL puts the
+confirmation in \texttt{ack\_id}, which the master ignores for those
+types, so the row stays queued and is delivered again. Redelivery
+uses a new POLL ID, so the node's duplicate check cannot catch it:
+delivery is at least once, not exactly once.
+
+\section{Week 5 -- Phone Interface and Embedded Web Client}
+
+\paragraph{Done.} Documented the captive portal (every DNS query
+answered with 192.168.4.1; redirects for other hosts and paths), the
+JSON WebSocket protocol, the offline-first client (IndexedDB with
+contacts, chats and messages; pending queue flushed on reconnect;
+back-off reconnect; three connection states; paging of 50 messages
+and a 1\,000-message quota per chat), and the build step that inlines
+CSS, JavaScript and base64 fonts into a 55\,642-byte gzip file
+embedded in the firmware.
+
+\paragraph{Problems.} The firmware still serves the small inline page,
+not the embedded client; the client expects \texttt{ack} frames and
+the firmware sends \texttt{queued} and \texttt{sent}; the chat list
+inserts contact names and message previews with \texttt{innerHTML}
+without escaping, a stored cross-site-scripting risk; the access
+point accepts at most 10 phones.
+
+\section{Week 6 -- Deployment, Operations and Field Validation}
+
+\paragraph{Done.} Documented the systemd service, build and install
+steps and the ESP-IDF toolchain; re-ran both host test suites on
+26~November (node 43 of 43; master 149 checks, 0 failed); wrote a
+staged field-validation plan (Chapter~6).
+
+\paragraph{Problems.} Installation is not self-contained;
+provisioning described in the README does not exist; credentials are
+in the repository; configuration constants have drifted from the
+radio registers; no measured results yet.
+
+% ===================================================================
+\chapter{Integration Findings}
+% ===================================================================
+
+\section{Errors, Causes and Status}
+
+{\small
+\begin{longtable}{|p{1.3in}|p{1.65in}|p{1.7in}|p{0.7in}|}
+  \hline
+  \textbf{Symptom} & \textbf{Cause} & \textbf{Fix or action} &
+  \textbf{Status} \\
+  \hline
+  \endhead
+  Chip stays in FSK mode &
+  LoRa bit writable only in sleep &
+  Sleep, set bit, standby; read back; retry & Fixed \\
+  \hline
+  Interrupt storms &
+  Floating DIO0 &
+  Pull-down; ignore empty IRQ; yield & Fixed \\
+  \hline
+  Nodes ignore POLL &
+  Master stamped its own ID &
+  POLL carries the addressed node ID & Fixed \\
+  \hline
+  Wrong delivery confirmed &
+  64-bit row ID in 8-bit field &
+  Pending record; delete on matching ACK & Fixed \\
+  \hline
+  Message echoed to sender &
+  Stale route to sender's node &
+  Detach route; store offline & Fixed \\
+  \hline
+  Chip leaves LoRa mode, TX hangs &
+  Supply dip under transmit current &
+  Minimum power; re-init; regulator advised & Mitigated \\
+  \hline
+  Board resets with WiFi on &
+  Small regulator at full WiFi power &
+  WiFi power limited to 8.5 dBm & Mitigated \\
+  \hline
+  DIO0 never fires on Pi &
+  Header says GPIO 24, code uses 23 &
+  Wire to the code; fix header & Open \\
+  \hline
+  Fresh Pi cannot build or find radio &
+  \texttt{install.sh} lacks libgpiod and SPI &
+  Add both to the script & Open \\
+  \hline
+  Logged RSSI too optimistic &
+  Offset $-157$ used at 433 MHz &
+  Use $-164$ before field tests & Open \\
+  \hline
+  Delivery repeated &
+  Master ignores \texttt{ack\_id} on DATA and PRESENCE &
+  Honour \texttt{ack\_id} on every reply & Open \\
+  \hline
+  Duplicates after lost ACK &
+  Redelivery gets a new POLL ID &
+  Stable end-to-end message ID & Open \\
+  \hline
+  Embedded UI not shown &
+  Handler returns inline page &
+  Serve embedded gzip file & Open \\
+  \hline
+  No delivered tick &
+  Client expects \texttt{ack}, firmware sends \texttt{queued} &
+  Align frames & Open \\
+  \hline
+  Markup in messages runs &
+  Chat list uses \texttt{innerHTML} unescaped &
+  Use \texttt{textContent} & Open \\
+  \hline
+  Cannot set node ID &
+  No \texttt{/config} handler; ID compiled in &
+  Add provisioning, store in NVS & Open \\
+  \hline
+  WiFi passphrase in repository &
+  Defined in source and README &
+  Change and externalise & Open \\
+  \hline
+  Config constants disagree &
+  20 dBm in header, registers set 14 and 2 &
+  Single source of truth & Open \\
+  \hline
+  Band and chip differ from design &
+  SX1278 cannot reach 865 MHz &
+  Decide band and hardware & Open \\
+  \hline
+\caption{Hardware, integration and interface findings}
+\end{longtable}
+}
+
+\section{Patterns}
+
+\begin{itemize}
+  \item \textbf{Bugs live in meaning, not size.} A field of the right
+    width with the wrong meaning passes unit tests on both sides and
+    fails over the air.
+  \item \textbf{Power is a software problem.} Three separate fixes
+    trace back to supply dips under transmit current.
+  \item \textbf{Documentation drifts.} Header pin, priority comments,
+    README provisioning and configuration constants all disagree with
+    the code.
+\end{itemize}
+
+% ===================================================================
+\chapter{Phone Interface and Deployment}
+% ===================================================================
+
+\section{Captive Portal and Protocol}
+
+A phone joining the WiFi network is sent to the chat page: a small DNS
+server answers every query with the node address, and HTTP requests
+for other hosts or paths are redirected to the root. The page opens a
+WebSocket to \texttt{/ws}. The phone sends \texttt{attach} (phone
+number) and \texttt{msg} (destination, text); the node answers
+\texttt{attached}, \texttt{msg}, \texttt{queued}, \texttt{sent},
+\texttt{status} (master online or not) and \texttt{error}. Sockets that
+connect but never attach are closed after 30~s, and the HTTP server
+purges the least recently used socket when full.
+
+\section{Embedded Web Client}
+
+The client is a 1\,271-line single-page application without
+frameworks. It keeps identity locally, stores contacts, chats and
+messages in IndexedDB (schema version 2), saves each outgoing message
+as \emph{pending} before sending, flushes pending messages after
+reconnect, reconnects with exponential back-off, and shows three
+states (disconnected, node only, mesh live). The chat list is paged
+(50 messages) with a 1\,000-message quota per chat. Its fonts are
+embedded, so it needs no internet.
+
+\section{Build Pipeline}
+
+\texttt{build\_ui.py} inlines CSS and JavaScript into one HTML file,
+converts the two fonts to base64 and compresses the result to a
+55\,642-byte gzip file. CMake runs the script as a custom command
+before compiling the component and embeds the file in the firmware
+image \cite{espidf}.
+
+\section{Access Point Settings}
+
+One shared SSID on every node so that phones roam; WPA2 on channel 1;
+at most 10 stations (a hardware limit); WiFi power limited to 8.5~dBm;
+receive buffers, socket count, a 10~s task watchdog and the USB
+console configured in \texttt{sdkconfig.defaults}.
+
+\section{Master Deployment}
+
+The master runs as a systemd service with automatic restart after five
+seconds and logs to the journal through syslog; \texttt{make install}
+and \texttt{install.sh} build, install and enable it. Node IDs are
+command-line arguments, and the unit file starts the master with nodes
+1 and 2. The queue database is an SQLite file in WAL mode
+\cite{sqlitewal}.
+
+% ===================================================================
+\chapter{Status and Field-Validation Plan}
+% ===================================================================
+
+\section{Status}
+
+\begin{itemize}
+  \item Software layers complete and verified on a laptop: node suite
+    43 of 43, master suite 149 checks with no failures (re-run on
+    26 November).
+  \item Hardware interface implemented on both platforms with
+    diagnostics; no field measurements recorded yet.
+\end{itemize}
+
+\section{Validation Plan}
+
+\begin{longtable}{|p{1.4in}|p{2.5in}|p{1.5in}|}
+  \hline
+  \textbf{Stage} & \textbf{Check} & \textbf{Expected (computed)} \\
+  \hline
+  \endhead
+  1. Bring-up & Version register on both radios & \texttt{0x12} \\
+  \hline
+  2. Point to point & One frame each way at bench distance &
+  Received, CRC good \\
+  \hline
+  3. Slot timing & POLL-to-ACK time & About 62 ms idle \\
+  \hline
+  4. Range & RSSI and SNR at rising distance, after fixing the
+  RSSI offset & Margin about 34 dB up, 22 dB down at 1 km \\
+  \hline
+  5. Soak & Hours of polling with supply voltage logged &
+  No brown-outs \\
+  \hline
+  6. Multi-node & Two nodes, roaming phones, offline delivery &
+  Each message once \\
+  \hline
+\end{longtable}
+
+\section{Fixes Before Deployment, in Priority Order}
+
+\begin{enumerate}
+  \item Honour \texttt{ack\_id} on every reply type at the master.
+  \item Escape the chat-list fields in the web client.
+  \item Serve the embedded client and align acknowledgement frames.
+  \item Add node provisioning (ID in NVS).
+  \item Complete \texttt{install.sh}; correct the DIO0 pin in
+    \texttt{radio.h}.
+  \item Correct the RSSI offset to $-164$.
+  \item Change the WiFi passphrase and move it out of the repository.
+  \item Settle the frequency band and radio hardware.
+\end{enumerate}
+
+\section{Reflection}
+
+Passing software tests is the start of deployment work, not the end.
+Radio band, power supply, antennas, installation scripts, credentials
+and measurement each need their own checklist. The most useful habit
+from this project was turning every claim into a number or a
+checkable statement, because that is what exposed the mismatches
+between design, code and documentation.
+
+% ===================================================================
+\printbibliography[heading=bibintoc]
+
+\end{document}
